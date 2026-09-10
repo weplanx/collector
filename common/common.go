@@ -9,7 +9,7 @@ import (
 
 // Log 是全局日志记录器实例。
 // 在 main 函数中通过 bootstrap.SetZap() 初始化。
-var Log *zap.Logger
+var Log = zap.NewNop()
 
 // Values 定义从 config/values.yml 加载的应用配置。
 type Values struct {

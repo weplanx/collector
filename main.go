@@ -7,8 +7,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/kainonly/collector/v3/app"
 	"github.com/kainonly/collector/v3/bootstrap"
@@ -16,6 +19,14 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		common.Log.Error(err.Error())
+		os.Exit(1)
+	}
+}
+
+// run 在返回前完成刷新并释放连接，使运行循环异常也能触发有序退出。
+func run() error {
 	// 初始化日志记录器
 	// 根据 MODE 环境变量选择开发模式或生产模式
 	var err error
@@ -34,7 +45,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer nc.Close()
+	defer func() {
+		// 确保最后一批确认消息已发送，再关闭 NATS 连接。
+		if err := nc.FlushTimeout(5 * time.Second); err != nil {
+			common.Log.Error("关闭前发送消息确认失败: " + err.Error())
+		}
+		nc.Close()
+	}()
 
 	// 创建 JetStream 上下文，用于流和消费者操作
 	js, err := bootstrap.UseJetStream(nc)
@@ -59,7 +76,8 @@ func main() {
 	db := bootstrap.UseDatabase(values, mc)
 
 	// 创建可取消的上下文，用于优雅关闭
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	// 初始化应用实例
 	x := app.New(values, nc, js, kv, db)
@@ -69,21 +87,11 @@ func main() {
 		panic(err)
 	}
 
-	// 在后台启动主运行循环
-	// 加载现有流配置并监听 KV 变更
-	go func() {
-		if err := x.Run(ctx); err != nil {
-			common.Log.Error(err.Error())
-		}
-	}()
-
-	// 等待中断信号 (Ctrl+C)
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	<-c
-
-	// 优雅关闭：取消上下文并停止所有收集器
-	// 停止前会刷新所有缓冲区中的数据
-	cancel()
-	x.Close()
+	// 主运行循环加载配置并监听变更，退出后先关闭收集器再释放连接。
+	defer x.Close()
+	err = x.Run(ctx)
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }

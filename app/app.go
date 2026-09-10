@@ -8,12 +8,12 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/kainonly/collector/v3/common"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -39,6 +39,9 @@ type App struct {
 	collectors sync.Map
 	// stopCh 用于通知关闭
 	stopCh chan struct{}
+	// lifecycle 串行化订阅变更与关闭，防止关闭后创建新收集器。
+	lifecycle sync.Mutex
+	closed    bool
 }
 
 // New 创建 App 实例。
@@ -105,51 +108,32 @@ func (x *App) SubName(key string) string {
 //
 // 此方法会阻塞直到 ctx 被取消。
 func (x *App) Run(ctx context.Context) (err error) {
-	// 加载所有现有的流配置
-	var keys []string
-	if keys, err = x.Kv.Keys(ctx); err != nil {
-		if errors.Is(err, jetstream.ErrNoKeysFound) {
-			keys = make([]string, 0)
-		} else {
-			return
-		}
-	}
-
-	// 为每个配置启动收集器
-	for _, key := range keys {
-		var entry jetstream.KeyValueEntry
-		if entry, err = x.Kv.Get(ctx, key); err != nil {
-			return
-		}
-		var option Option
-		if err = sonic.Unmarshal(entry.Value(), &option); err != nil {
-			common.Log.Error("解码失败",
-				zap.String("key", key),
-				zap.Error(err),
-			)
-			return
-		}
-		if err = x.Subscribe(option); err != nil {
-			common.Log.Error("订阅失败",
-				zap.String("key", key),
-				zap.Error(err),
-			)
-		}
-	}
-	common.Log.Info(`服务初始化成功`)
-
-	// 开始监听 KV 变更
+	// 同一个监听依次提供初始快照和后续变更，避免分开读取造成事件丢失。
 	var watch jetstream.KeyWatcher
 	if watch, err = x.Kv.WatchAll(ctx); err != nil {
 		return
 	}
+	defer watch.Stop()
 
 	common.Log.Info(`正在监听配置变更`)
-	// 记录当前时间，忽略历史事件
-	cur := time.Now()
-	for entry := range watch.Updates() {
-		// 跳过空条目和历史条目
-		if entry == nil || entry.Created().Unix() < cur.Unix() {
+	for {
+		var entry jetstream.KeyValueEntry
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-x.stopCh:
+			return nil
+		case update, ok := <-watch.Updates():
+			if !ok {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errors.New("配置监听意外关闭")
+			}
+			entry = update
+		}
+		if entry == nil {
+			common.Log.Info("服务初始化成功")
 			continue
 		}
 		key := entry.Key()
@@ -157,18 +141,19 @@ func (x *App) Run(ctx context.Context) (err error) {
 		case jetstream.KeyValuePut:
 			// 新增或更新配置，创建/重建收集器
 			var option Option
-			if err = sonic.Unmarshal(entry.Value(), &option); err != nil {
+			if err = json.Unmarshal(entry.Value(), &option); err != nil || option.Key != key {
 				common.Log.Error("解码失败",
-					zap.ByteString("data", entry.Value()),
+					zap.String("key", key),
 					zap.Error(err),
 				)
-				return
+				continue
 			}
 			if err = x.Subscribe(option); err != nil {
 				common.Log.Error("订阅失败",
 					zap.String("key", key),
 					zap.Error(err),
 				)
+				return fmt.Errorf("订阅 %s 失败: %w", key, err)
 			}
 		case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
 			// 删除配置，停止收集器并清理流
@@ -180,8 +165,6 @@ func (x *App) Run(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	return
 }
 
 // Subscribe 为指定配置创建收集器并开始消费消息。
@@ -189,6 +172,11 @@ func (x *App) Run(ctx context.Context) (err error) {
 // 如果该 key 已有收集器在运行，会先停止旧的再创建新的。
 // 这允许配置的热更新。
 func (x *App) Subscribe(option Option) (err error) {
+	x.lifecycle.Lock()
+	defer x.lifecycle.Unlock()
+	if x.closed {
+		return errors.New("应用已关闭")
+	}
 	// 如果已存在，先停止旧的收集器
 	if v, ok := x.collectors.Load(option.Key); ok {
 		v.(*Collector).Stop()
@@ -222,6 +210,11 @@ func (x *App) Subscribe(option Option) (err error) {
 //
 // 停止收集器时会先刷新缓冲区中的剩余消息。
 func (x *App) Unsubscribe(key string) (err error) {
+	x.lifecycle.Lock()
+	defer x.lifecycle.Unlock()
+	if x.closed {
+		return errors.New("应用已关闭")
+	}
 	// 停止收集器
 	if v, ok := x.collectors.Load(key); ok {
 		v.(*Collector).Stop()
@@ -232,22 +225,31 @@ func (x *App) Unsubscribe(key string) (err error) {
 	defer cancel()
 
 	// 删除 JetStream 流
-	if err = x.Js.DeleteStream(ctx, x.StreamName(key)); err != nil {
+	if err = x.Js.DeleteStream(ctx, x.StreamName(key)); err != nil && !errors.Is(err, jetstream.ErrStreamNotFound) {
 		return
 	}
 	common.Log.Info("取消订阅成功",
 		zap.String("key", key),
 	)
-	return
+	return nil
 }
 
 // Close 优雅关闭所有收集器。
 //
-// 停止每个收集器时会刷新其缓冲区，确保数据不丢失。
+// 等待所有收集器完成最后刷新；写入失败的消息保留在 JetStream 中重试。
 func (x *App) Close() {
+	x.lifecycle.Lock()
+	defer x.lifecycle.Unlock()
+	if x.closed {
+		return
+	}
+	x.closed = true
 	close(x.stopCh)
+	var wg sync.WaitGroup
 	x.collectors.Range(func(key, value any) bool {
-		value.(*Collector).Stop()
+		wg.Add(1)
+		go func() { defer wg.Done(); value.(*Collector).Stop() }()
 		return true
 	})
+	wg.Wait()
 }

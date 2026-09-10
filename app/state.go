@@ -1,9 +1,9 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 
-	"github.com/bytedance/sonic"
 	"github.com/kainonly/collector/v3/common"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
@@ -58,5 +58,5 @@ func (x *App) LoadState(key string) (b []byte, err error) {
 	}
 	collector := v.(*Collector)
 	state := &State{BufferSize: collector.BufferSize()}
-	return sonic.Marshal(state)
+	return json.Marshal(state)
 }

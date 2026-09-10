@@ -1,16 +1,12 @@
-name: Testing
+name: 测试
 
 on:
   push:
     branches: [ v3 ]
-    paths-ignore:
-      - 'README*'
-      - 'docs/**'
+    paths-ignore: [ 'README*', 'docs/**' ]
   pull_request:
     branches: [ v3 ]
-    paths-ignore:
-      - 'README*'
-      - 'docs/**'
+    paths-ignore: [ 'README*', 'docs/**' ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,83 +18,46 @@ permissions:
 jobs:
   testing:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        go: [ '1.24.x', '1.26.x' ]
     env:
-      GO111MODULE: on
-      NATS_NAMESPACE: test
-      NATS_HOST: nats://127.0.0.1:4222
+      CGO_ENABLED: '1'
+      NATS_HOSTS: nats://127.0.0.1:4222
       NATS_TOKEN: s3cr3t
-
+      MONGO_URL: mongodb://root:password@127.0.0.1:27017
     steps:
-      - name: Checkout code
+      - name: 检出代码
         uses: actions/checkout@v4
-
-      - name: Start NATS cluster
-        run: docker compose -f ".github/compose/docker-compose.yml" up -d
-
-      - name: Wait for NATS cluster
-        run: |
-          for i in {1..30}; do
-            if nc -z localhost 4222; then
-              echo "NATS is ready"
-              break
-            fi
-            echo "Waiting for NATS..."
-            sleep 1
-          done
-
-      - name: Set up Go
+      - name: 安装 Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ matrix.go }}
           cache: true
-
-      - name: Prepare test config
+      - name: 启动测试服务
+        run: docker compose -f .github/compose/docker-compose.yml up -d
+      - name: 等待测试服务就绪
         run: |
-          cat > config/values.yml <<'EOF'
-          mode: debug
-          namespace: test
-          description: 测试收集器
-          batch_size: 1000
-          flush_interval: 5s
-          nats_hosts:
-            - nats://127.0.0.1:4222
-            - nats://127.0.0.1:4223
-            - nats://127.0.0.1:4224
-          nats_token: s3cr3t
-          mongo_url: mongodb://root:password@127.0.0.1:27017
-          mongo_database: test
-          EOF
-
-      - name: Start collector service
-        run: |
-          go run . >/tmp/collector.log 2>&1 &
-          echo $! > /tmp/collector.pid
-
-      - name: Wait for collector
-        run: |
-          for i in {1..30}; do
-            if grep -q "stream initialized" /tmp/collector.log; then
-              echo "collector is ready"
-              break
+          for i in {1..60}; do
+            if nc -z localhost 4222 && docker compose -f .github/compose/docker-compose.yml exec -T mongodb mongosh --quiet --username root --password password --authenticationDatabase admin --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              exit 0
             fi
-            echo "Waiting for collector..."
             sleep 1
           done
-
-      - name: Run tests with coverage
-        run: go test -race -covermode atomic -coverprofile=covprofile ./...
-
-      - name: Stop collector service
-        if: always()
+          docker compose -f .github/compose/docker-compose.yml logs
+          exit 1
+      - name: 编译与静态检查
         run: |
-          if [ -f /tmp/collector.pid ]; then
-            kill "$(cat /tmp/collector.pid)" || true
-          fi
-
-      - name: Upload coverage to Coveralls
-        if: success() && github.event_name == 'push'
+          go build ./...
+          go vet -tags=e2e ./...
+      - name: 单元及集成测试
+        run: go test -race -tags=e2e -timeout=3m -covermode=atomic -coverprofile=covprofile ./...
+      - name: 停止测试服务
+        if: always()
+        run: docker compose -f .github/compose/docker-compose.yml down -v
+      - name: 上传覆盖率
+        if: success() && github.event_name == 'push' && matrix.go == '1.26.x'
         run: |
           go install github.com/mattn/goveralls@latest
           goveralls -coverprofile=covprofile -service=github

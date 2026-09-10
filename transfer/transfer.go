@@ -22,12 +22,12 @@ package transfer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -63,7 +63,7 @@ type Transfer struct {
 // KV 存储桶必须已存在（由收集器或手动创建）。
 func New(ctx context.Context, namespace string, nc *nats.Conn, opts ...jetstream.JetStreamOpt) (x *Transfer, err error) {
 	// 验证命名空间格式
-	// 连字符在 NATS 主题中有特殊含义，禁止使用
+	// 保留现有命名空间约束，避免改变已有调用方的行为。
 	if strings.Contains(namespace, "-") {
 		return nil, errors.New(`namespace 不能包含 '-'`)
 	}
@@ -130,16 +130,21 @@ func (x *Transfer) Get(ctx context.Context, key string) (option *Option, err err
 	if entry, err = x.Kv.Get(ctx, key); err != nil {
 		return
 	}
-	if err = sonic.Unmarshal(entry.Value(), &option); err != nil {
+	if err = json.Unmarshal(entry.Value(), &option); err != nil {
 		return
+	}
+	if option == nil {
+		return nil, errors.New("流配置不能为空")
 	}
 
 	// 向收集器请求状态
 	var msg *nats.Msg
-	if msg, err = x.Nc.Request(fmt.Sprintf(`%s.states`, x.Namespace), []byte(key), 15*time.Second); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if msg, err = x.Nc.RequestWithContext(ctx, fmt.Sprintf(`%s.states`, x.Namespace), []byte(key)); err != nil {
 		return
 	}
-	if err = sonic.Unmarshal(msg.Data, &option.State); err != nil {
+	if err = json.Unmarshal(msg.Data, &option.State); err != nil {
 		return
 	}
 	return
@@ -191,7 +196,7 @@ func (x *Transfer) Add(ctx context.Context, option Option) (err error) {
 	// 将配置写入 KV
 	// 收集器监听 KV 变更，会自动订阅此流
 	var b []byte
-	if b, err = sonic.Marshal(option); err != nil {
+	if b, err = json.Marshal(option); err != nil {
 		return
 	}
 	if _, err = x.Kv.Put(ctx, option.Key, b); err != nil {
@@ -203,19 +208,22 @@ func (x *Transfer) Add(ctx context.Context, option Option) (err error) {
 // Send 发布 BSON 编码的数据到指定流。
 //
 // 数据会被序列化为 BSON 格式后发布到 {namespace}.{key} 主题。
-// 使用异步发布，调用返回不代表消息已持久化。
-//
-// 如需确认发布完成，可使用：
-//
-//	<-t.Js.PublishAsyncComplete()
-func (x *Transfer) Send(key string, data any) (err error) {
+// 等待服务端确认，默认超时为 15 秒；成功不代表已经写入 MongoDB。
+func (x *Transfer) Send(key string, data any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return x.SendContext(ctx, key, data)
+}
+
+// SendContext 发布 BSON 数据并等待确认，允许调用方控制超时和取消。
+func (x *Transfer) SendContext(ctx context.Context, key string, data any) (err error) {
 	// 序列化为 BSON
 	var content []byte
 	if content, err = bson.Marshal(data); err != nil {
 		return
 	}
-	// 异步发布到 JetStream
-	if _, err = x.Js.PublishAsync(x.SubName(key), content); err != nil {
+	// 将服务端拒绝、超时等错误返回调用方。
+	if _, err = x.Js.Publish(ctx, x.SubName(key), content); err != nil {
 		return
 	}
 	return
